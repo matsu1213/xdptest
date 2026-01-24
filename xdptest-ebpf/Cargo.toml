@@ -1,0 +1,17 @@
+[package]
+name = "xdptest-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+xdptest-common = { path = "../xdptest-common" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "xdptest"
+path = "src/main.rs"
