@@ -34,18 +34,32 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
         IpProto::Tcp => {
             let tcphdr: *const TcpHdr =
                 ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
-            u16::from_be_bytes(unsafe { (*tcphdr).source })
+            u16::from_be_bytes(unsafe { (*tcphdr).dest })
         }
         IpProto::Udp => {
-            let udphdr: *const UdpHdr =
-                ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
-            unsafe { (*udphdr).src_port() }
+            //let udphdr: *const UdpHdr =
+            //    ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
+            //unsafe { (*udphdr).dst_port() }
+            return Ok(xdp_action::XDP_PASS);
         }
         _ => return Err(()),
     };
 
+    let is_syn = match unsafe { (*ipv4hdr).proto } {
+        IpProto::Tcp => {
+            let tcphdr: *const TcpHdr =
+                ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
+            unsafe { (*tcphdr).syn() != 0 }
+        }
+        _ => false,
+    };
+
+    if !is_syn {
+        return Ok(xdp_action::XDP_PASS);
+    }
+
     // (3)
-    info!(&ctx, "SRC IP: {:i}, SRC PORT: {}", source_addr, source_port);
+    info!(&ctx, "SRC IP: {:i}, DST PORT: {}, FLAG: {}", source_addr, source_port, "SYN");
 
     Ok(xdp_action::XDP_PASS)
 }
