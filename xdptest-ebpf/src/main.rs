@@ -45,18 +45,27 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
         _ => return Err(()),
     };
 
-    let is_syn = match unsafe { (*ipv4hdr).proto } {
-        IpProto::Tcp => {
-            let tcphdr: *const TcpHdr =
-                ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
-            unsafe { (*tcphdr).syn() != 0 }
-        }
-        _ => false,
-    };
-
-    if !is_syn {
+    if unsafe { (*ipv4hdr).proto } != IpProto::Tcp {
         return Ok(xdp_action::XDP_PASS);
     }
+
+    let tcphdr: *const TcpHdr = ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
+    let is_initial_syn = unsafe { (*tcphdr).syn() != 0 && (*tcphdr).ack() == 0 };
+    
+    if !is_initial_syn {
+        return Ok(xdp_action::XDP_PASS);
+    }
+
+    let doff = unsafe { (*tcphdr).doff() }; 
+    let tcp_header_len = (doff as usize) * 4;
+
+    let mut offset = EthHdr::LEN + Ipv4Hdr::LEN + 20;
+    let options_end = EthHdr::LEN + Ipv4Hdr::LEN + tcp_header_len;
+
+    let window_size = u16::from_be_bytes(unsafe { (*tcphdr).window});
+
+    let mut options = Vec::new();
+    
 
     // (3)
     info!(&ctx, "SRC IP: {:i}, DST PORT: {}, FLAG: {}", source_addr, source_port, "SYN");
