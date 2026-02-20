@@ -51,66 +51,79 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
 
     let doff = unsafe { (*tcphdr).doff() }; 
     let tcp_header_len = (doff as usize) * 4;
+    
+    // TCPヘッダが20バイト未満は不正、オプションは最大40バイト
+    if tcp_header_len < 20 {
+        return Ok(xdp_action::XDP_PASS);
+    }
+    let options_len = core::cmp::min(tcp_header_len - 20, 40);
 
-    let mut offset = EthHdr::LEN + Ipv4Hdr::LEN + 20;
-    // Verifierを安心させるための絶対的な上限 (14 + 20 + 最大TCP長60 = 94)
-    let max_safe_offset = EthHdr::LEN + Ipv4Hdr::LEN + 60;
+    // 【魔法の解決策】TCPオプションをスタックに一括コピーする
+    let mut tcp_options_buf = [0u8; 40];
+    
+    if options_len > 0 {
+        let opt_offset = EthHdr::LEN + Ipv4Hdr::LEN + 20;
+        let start = ctx.data();
+        let end = ctx.data_end();
+        
+        // パケットの境界チェックは、ここで「1回だけ」行う！
+        if start + opt_offset + options_len > end {
+            return Ok(xdp_action::XDP_PASS); 
+        }
+        
+        // 安全が証明されたので、40バイトのローカル配列に一括コピー
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (start + opt_offset) as *const u8,
+                tcp_options_buf.as_mut_ptr(),
+                options_len
+            );
+        }
+    }
 
-    let window_size = u16::from_be_bytes(unsafe { (*tcphdr).window});
+    let window_size = u16::from_be_bytes(unsafe { (*tcphdr).window });
 
     let mut options = [0u8; 32];
     let mut index = 0usize;
     let mut mss = 0u16;
     let mut wscale = 0u8;
+    let mut offset = 0usize;
 
-    let start = ctx.data();
-    let end = ctx.data_end();
-
-    // 【重要】Result/Optionを避けるため、マクロで直接パケットから読み取ります。
-    // 範囲外ならその場でループを抜ける(break)ため、スタックの読み取りエラーが起きません。
-    macro_rules! read_byte {
-        ($off:expr) => {{
-            if start + $off + 1 > end {
-                break;
-            }
-            unsafe { *(start as *const u8).add($off) }
-        }};
-    }
-
-    for _ in 0..20 {
-        if offset >= max_safe_offset || offset >= EthHdr::LEN + Ipv4Hdr::LEN + tcp_header_len { 
-            break; 
-        }
-
-        let kind = read_byte!(offset);
+    // パケット(R5)ではなく、スタック上の配列(tcp_options_buf)を解析する
+    // これでVerifierのパケット範囲外エラーは絶対に起きません
+    for _ in 0..40 {
+        if offset >= 40 || offset >= options_len { break; }
         
-        // Optionを使わず、手動で境界チェックしてポインタ書き込み（Verifierフレンドリー）
-        if index < options.len() {
+        let kind = unsafe { *tcp_options_buf.as_ptr().add(offset) };
+        
+        if index < 32 {
             unsafe { *options.as_mut_ptr().add(index) = kind; }
         }
-        
         offset += 1;
 
         if kind == 0 || kind == 1 {
             index += 1;
             continue;
         } else if kind == 2 { // MSS
-            let length = read_byte!(offset);
+            if offset + 3 > 40 || offset + 3 > options_len { break; }
+            let length = unsafe { *tcp_options_buf.as_ptr().add(offset) };
             if length == 4 {
-                let b1 = read_byte!(offset + 1);
-                let b2 = read_byte!(offset + 2);
+                let b1 = unsafe { *tcp_options_buf.as_ptr().add(offset + 1) };
+                let b2 = unsafe { *tcp_options_buf.as_ptr().add(offset + 2) };
                 mss = u16::from_be_bytes([b1, b2]);
             }
             offset += length.saturating_sub(1) as usize;
         } else if kind == 3 { // WSCALE
-            let length = read_byte!(offset);
+            if offset + 2 > 40 || offset + 2 > options_len { break; }
+            let length = unsafe { *tcp_options_buf.as_ptr().add(offset) };
             if length == 3 {
-                wscale = read_byte!(offset + 1);
+                wscale = unsafe { *tcp_options_buf.as_ptr().add(offset + 1) };
             }
             offset += length.saturating_sub(1) as usize;
         } else {
-            let length = read_byte!(offset);
-            if length == 0 { break; } // 無限ループ防止
+            if offset >= 40 || offset >= options_len { break; }
+            let length = unsafe { *tcp_options_buf.as_ptr().add(offset) };
+            if length == 0 { break; }
             offset += length.saturating_sub(1) as usize;
         }
         index += 1;
@@ -121,7 +134,6 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
     let mut ja4t_buf = [0u8; 64];
     let ja4t_len = ja4t.write_to(&mut ja4t_buf);
     
-    // スライスの取得もOptionを生成しない方法(生のポインタ)で切り出します
     let ja4t_slice = unsafe { core::slice::from_raw_parts(ja4t_buf.as_ptr(), ja4t_len) };
     let ja4t_str = unsafe { core::str::from_utf8_unchecked(ja4t_slice) };
 
@@ -142,9 +154,8 @@ impl JA4T {
         w.push(b'_');
 
         let mut first = true;
-        // イテレータ展開を避けるためにインデックスループを使用
         for i in 0..32 {
-            let opt = self.options[i]; // ここは静的サイズ内なので安全
+            let opt = self.options[i];
             if opt == 0 { break; }
             if !first {
                 w.push(b'-');
@@ -171,7 +182,6 @@ impl BufWriter<'_> {
     #[inline(always)]
     fn push(&mut self, b: u8) {
         if self.pos < self.buf.len() {
-            // パニック分岐とOption生成を完全に防ぐ生ポインタ書き込み
             unsafe {
                 *self.buf.as_mut_ptr().add(self.pos) = b;
             }
@@ -179,7 +189,6 @@ impl BufWriter<'_> {
         }
     }
 
-    // u64からu16に変更 (最大65535のため)。割り算のコストが劇的に下がりVerifierが安定します。
     #[inline(always)]
     fn push_num(&mut self, mut n: u16) {
         if n == 0 {
@@ -187,7 +196,7 @@ impl BufWriter<'_> {
             return;
         }
         
-        let mut tmp = [0u8; 5]; // u16は最大5桁
+        let mut tmp = [0u8; 5]; 
         let mut i = 5;
         while n > 0 && i > 0 {
             i -= 1;
@@ -195,7 +204,6 @@ impl BufWriter<'_> {
             n /= 10;
         }
         
-        // sliceのcopy_from_sliceもOptionを呼ぶ場合があるので、単純なループにします
         for j in i..5 {
             self.push(tmp[j]);
         }
