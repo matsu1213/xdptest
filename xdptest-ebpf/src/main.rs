@@ -27,7 +27,7 @@ pub fn xdptest(ctx: XdpContext) -> u32 {
 }
 
 fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
-    let ethhdr: *const EthHdr = ptr_at(&ctx, 0)?; // (2)
+    let ethhdr: *const EthHdr = ptr_at(&ctx, 0)?;
     match unsafe { (*ethhdr).ether_type() } {
         Ok(EtherType::Ipv4) => {}
         _ => return Ok(xdp_action::XDP_PASS),
@@ -62,54 +62,61 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
     let mut mss = 0u16;
     let mut wscale = 0u8;
 
+    let start = ctx.data();
+    let end = ctx.data_end();
+
     for _ in 0..50 {
         if offset >= options_end { break; }
 
-        let kind = unsafe { *(ctx.data() as *const u8).add(offset) };
-        if index < options.len() {
-            options[index] = kind;
+        if start + offset + 1 > end { break; }
+
+        let kind = unsafe { *(start as *const u8).add(offset) };
+        
+        if let Some(opt) = options.get_mut(index) {
+            *opt = kind;
         }
+        
         offset += 1;
 
         if kind == 0 {
-            continue; // End of Option List, but we will continue to check if there are more options.
+            continue;
         } else if kind == 1 {
             continue;
         } else if kind == 2 {
             // MSS Option
-            if offset + 3 > options_end {
-                continue; // Not enough space for MSS option
+            if offset + 3 > options_end || start + offset + 3 > end {
+                continue; 
             }
-            let length = unsafe { *(ctx.data() as *const u8).add(offset) };
+            let length = unsafe { *(start as *const u8).add(offset) };
             if length != 4 {
-                continue; // Invalid MSS option length
+                continue; 
             }
             mss = u16::from_be_bytes([
-                unsafe { *(ctx.data() as *const u8).add(offset + 1) },
-                unsafe { *(ctx.data() as *const u8).add(offset + 2) },
+                unsafe { *(start as *const u8).add(offset + 1) },
+                unsafe { *(start as *const u8).add(offset + 2) },
             ]);
-            offset += 3; // Move past MSS option
+            offset += 3; 
         } else if kind == 3 {
             // WSCALE Option
-            if offset + 2 > options_end {
-                continue; // Not enough space for WSCALE option
+            if offset + 2 > options_end || start + offset + 2 > end {
+                continue; 
             }
-            let length = unsafe { *(ctx.data() as *const u8).add(offset) };
+            let length = unsafe { *(start as *const u8).add(offset) };
             if length != 3 {
-                continue; // Invalid WSCALE option length
+                continue; 
             }
-            wscale = unsafe { *(ctx.data() as *const u8).add(offset + 1) };
-            offset += 2; // Move past WSCALE option
+            wscale = unsafe { *(start as *const u8).add(offset + 1) };
+            offset += 2; 
         }
         index += 1;
     }
 
     let ja4t = JA4T::new(window_size, options, mss, wscale);
 
-    // (3) build JA4T ascii into fixed buffer and log
     let mut ja4t_buf = [0u8; 64];
     let ja4t_len = ja4t.write_to(&mut ja4t_buf);
-    let ja4t_str = unsafe { core::str::from_utf8_unchecked(&ja4t_buf[..ja4t_len]) };
+    let ja4t_slice = ja4t_buf.get(..ja4t_len).unwrap_or(&ja4t_buf);
+    let ja4t_str = unsafe { core::str::from_utf8_unchecked(ja4t_slice) };
 
     info!(&ctx, "SRC IP: {:i}, DST PORT: {}, JA4T: {}", source_addr, dest_port, ja4t_str);
 
@@ -121,17 +128,12 @@ impl JA4T {
         Self { window_size, options, mss, wscale }
     }
 
-    // Write JA4T into the provided buffer in the format:
-    // Example: 65535_2-4-8-1-3_1460_7
-    // Returns number of bytes written.
     fn write_to(&self, dst: &mut [u8]) -> usize {
         let mut w = BufWriter { buf: dst, pos: 0 };
 
-        // window_size
         w.push_num(self.window_size as u64);
         w.push(b'_');
 
-        // options list (sep by '-')
         let mut first = true;
         for &opt in &self.options {
             if opt == 0 { break; }
@@ -143,65 +145,65 @@ impl JA4T {
         }
 
         w.push(b'_');
-        
-        // mss
         w.push_num(self.mss as u64);
         w.push(b'_');
-        
-        // wscale
         w.push_num(self.wscale as u64);
 
         w.pos
     }
 }
 
-// バッファへの書き込みと境界チェックを一元管理するヘルパー
 struct BufWriter<'a> {
     buf: &'a mut [u8],
     pos: usize,
 }
 
 impl BufWriter<'_> {
-    // 1バイトだけ書き込む
     #[inline]
     fn push(&mut self, b: u8) {
-        if self.pos < self.buf.len() {
-            self.buf[self.pos] = b;
+        if let Some(byte) = self.buf.get_mut(self.pos) {
+            *byte = b;
             self.pos += 1;
         }
     }
 
-    // スライス（複数バイト）を安全に書き込む
     #[inline]
     fn push_bytes(&mut self, bytes: &[u8]) {
-        let remain = self.buf.len() - self.pos;
+        let remain = self.buf.len().saturating_sub(self.pos);
         let len = core::cmp::min(remain, bytes.len());
-        self.buf[self.pos..self.pos + len].copy_from_slice(&bytes[..len]);
-        self.pos += len;
+        
+        if let (Some(dst), Some(src)) = (
+            self.buf.get_mut(self.pos..self.pos + len),
+            bytes.get(..len)
+        ) {
+            dst.copy_from_slice(src);
+            self.pos += len;
+        }
     }
 
-    // u64数値をアスキー文字列として書き込む
     fn push_num(&mut self, mut n: u64) {
         if n == 0 {
             self.push(b'0');
             return;
         }
         
-        // u64の最大文字数は20桁なので、バッファを確保して後ろから詰める
         let mut tmp = [0u8; 20];
         let mut i = 20;
-        while n > 0 {
+        while n > 0 && i > 0 {
             i -= 1;
-            tmp[i] = b'0' + (n % 10) as u8;
+            if let Some(byte) = tmp.get_mut(i) {
+                *byte = b'0' + (n % 10) as u8;
+            }
             n /= 10;
         }
         
-        // 完成した文字列部分をまとめて書き込み
-        self.push_bytes(&tmp[i..]);
+        if let Some(slice) = tmp.get(i..) {
+            self.push_bytes(slice);
+        }
     }
 }
 
-#[inline(always)] // (1)
+#[inline(always)]
 fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
     let start = ctx.data();
     let end = ctx.data_end();
