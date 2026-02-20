@@ -49,44 +49,39 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_PASS);
     }
 
-    let doff = unsafe { (*tcphdr).doff() } & 0x0F; 
+    let doff = unsafe { (*tcphdr).doff() }; 
     let tcp_header_len = (doff as usize) * 4;
     
-    // TCPヘッダが20バイト未満は不正
     if tcp_header_len < 20 {
         return Ok(xdp_action::XDP_PASS);
     }
-
-    // 【修正2 魔法のコード】
-    // saturating_sub で絶対にマイナスにさせない ＋ `& 0x3F` で最大63以下に縛る！
-    // これにより Verifier は「あ、この変数は 0〜63 の範囲の正の数だな」と100%確信します。
-    let mut options_len = tcp_header_len.saturating_sub(20) & 0x3F;
     
-    // 念のため40を超えないようにする
+    // オプションの長さ（最大40バイトに制限）
+    let mut options_len = tcp_header_len - 20;
     if options_len > 40 {
         options_len = 40;
     }
 
     let mut tcp_options_buf = [0u8; 40];
-    
-    if options_len > 0 {
-        let opt_offset = EthHdr::LEN + Ipv4Hdr::LEN + 20;
-        let start = ctx.data();
-        let end = ctx.data_end();
-        
-        // Verifierが options_len は「0〜40の正の数」と理解したので、
-        // 以下の pointer math で unbounded min エラーが出なくなります。
-        if start + opt_offset + options_len > end {
-            return Ok(xdp_action::XDP_PASS); 
+    let opt_base_offset = EthHdr::LEN + Ipv4Hdr::LEN + 20;
+    let start = ctx.data();
+    let end = ctx.data_end();
+
+    // 【最後の魔法】1バイトずつの固定ループコピー
+    // Verifierは i を「0, 1, 2...」という定数として解釈するため、
+    // 「パケットポインタ + 動的変数」の計算が完全に消滅します！
+    for i in 0..40 {
+        if i >= options_len {
+            break; // 必要な分だけコピーしたら抜ける
         }
         
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                (start + opt_offset) as *const u8,
-                tcp_options_buf.as_mut_ptr(),
-                options_len
-            );
+        // start + (定数) + 1 > end の形になり、Verifierが完璧に理解できる
+        if start + opt_base_offset + i + 1 > end {
+            break;
         }
+        
+        // 1バイトずつスタック上の配列にコピー
+        tcp_options_buf[i] = unsafe { *(start as *const u8).add(opt_base_offset + i) };
     }
 
     let window_size = u16::from_be_bytes(unsafe { (*tcphdr).window });
@@ -97,8 +92,8 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
     let mut wscale = 0u8;
     let mut offset = 0usize;
 
-    // パケット(R5)ではなく、スタック上の配列(tcp_options_buf)を解析する
-    // これでVerifierのパケット範囲外エラーは絶対に起きません
+    // パケット(ctx.data)ではなく、コピー済みの tcp_options_buf を解析する
+    // ここから先は「ただのローカル変数の処理」になるため、絶対にパケットエラーは出ません。
     for _ in 0..40 {
         if offset >= 40 || offset >= options_len { break; }
         
