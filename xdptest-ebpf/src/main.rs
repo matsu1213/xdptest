@@ -2,7 +2,7 @@
 #![no_main]
 
 use core::mem;
-use aya_ebpf::{bindings::{SO_RCVLOWAT, xdp_action}, macros::xdp, programs::XdpContext};
+use aya_ebpf::{bindings::xdp_action, macros::xdp, programs::XdpContext};
 use aya_log_ebpf::info;
 
 use network_types::{
@@ -53,9 +53,9 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
     let tcp_header_len = (doff as usize) * 4;
 
     let mut offset = EthHdr::LEN + Ipv4Hdr::LEN + 20;
-    
+    // Verifierを安心させるための絶対的な上限 (14 + 20 + 最大TCP長60 = 94)
     let max_safe_offset = EthHdr::LEN + Ipv4Hdr::LEN + 60;
-    
+
     let window_size = u16::from_be_bytes(unsafe { (*tcphdr).window});
 
     let mut options = [0u8; 32];
@@ -66,55 +66,51 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
     let start = ctx.data();
     let end = ctx.data_end();
 
-    let read_byte = |off: usize| -> Result<u8, ()> {
-        if start + off + 1 > end {
-            return Err(());
+    // 【重要】Result/Optionを避けるため、マクロで直接パケットから読み取ります。
+    // 範囲外ならその場でループを抜ける(break)ため、スタックの読み取りエラーが起きません。
+    macro_rules! read_byte {
+        ($off:expr) => {{
+            if start + $off + 1 > end {
+                break;
+            }
+            unsafe { *(start as *const u8).add($off) }
+        }};
+    }
+
+    for _ in 0..20 {
+        if offset >= max_safe_offset || offset >= EthHdr::LEN + Ipv4Hdr::LEN + tcp_header_len { 
+            break; 
         }
-        Ok(unsafe { *(start as *const u8).add(off) })
-    };
 
-    for _ in 0..15 {
-        if offset >= EthHdr::LEN + Ipv4Hdr::LEN + tcp_header_len { break; }
-        if offset >= max_safe_offset { break; }
-
-        let Ok(kind) = read_byte(offset) else { break };
+        let kind = read_byte!(offset);
         
-        if let Some(opt) = options.get_mut(index) {
-            *opt = kind;
+        // Optionを使わず、手動で境界チェックしてポインタ書き込み（Verifierフレンドリー）
+        if index < options.len() {
+            unsafe { *options.as_mut_ptr().add(index) = kind; }
         }
         
         offset += 1;
 
         if kind == 0 || kind == 1 {
-            // End of Option List (0) or No-Operation (1)
             index += 1;
             continue;
-        } else if kind == 2 {
-            // MSS Option (Length 4)
-            if offset + 3 > max_safe_offset { break; } // 固定値上限チェック
-            
-            let Ok(length) = read_byte(offset) else { break };
+        } else if kind == 2 { // MSS
+            let length = read_byte!(offset);
             if length == 4 {
-                if let (Ok(b1), Ok(b2)) = (read_byte(offset + 1), read_byte(offset + 2)) {
-                    mss = u16::from_be_bytes([b1, b2]);
-                }
+                let b1 = read_byte!(offset + 1);
+                let b2 = read_byte!(offset + 2);
+                mss = u16::from_be_bytes([b1, b2]);
             }
-            offset += length.saturating_sub(1) as usize; 
-        } else if kind == 3 {
-            // WSCALE Option (Length 3)
-            if offset + 2 > max_safe_offset { break; }
-            
-            let Ok(length) = read_byte(offset) else { break };
+            offset += length.saturating_sub(1) as usize;
+        } else if kind == 3 { // WSCALE
+            let length = read_byte!(offset);
             if length == 3 {
-                if let Ok(w) = read_byte(offset + 1) {
-                    wscale = w;
-                }
+                wscale = read_byte!(offset + 1);
             }
             offset += length.saturating_sub(1) as usize;
         } else {
-            if offset + 1 > max_safe_offset { break; }
-            let Ok(length) = read_byte(offset) else { break };
-            if length == 0 { break; } 
+            let length = read_byte!(offset);
+            if length == 0 { break; } // 無限ループ防止
             offset += length.saturating_sub(1) as usize;
         }
         index += 1;
@@ -124,7 +120,9 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
 
     let mut ja4t_buf = [0u8; 64];
     let ja4t_len = ja4t.write_to(&mut ja4t_buf);
-    let ja4t_slice = ja4t_buf.get(..ja4t_len).unwrap_or(&ja4t_buf);
+    
+    // スライスの取得もOptionを生成しない方法(生のポインタ)で切り出します
+    let ja4t_slice = unsafe { core::slice::from_raw_parts(ja4t_buf.as_ptr(), ja4t_len) };
     let ja4t_str = unsafe { core::str::from_utf8_unchecked(ja4t_slice) };
 
     info!(&ctx, "SRC IP: {:i}, DST PORT: {}, JA4T: {}", source_addr, dest_port, ja4t_str);
@@ -140,23 +138,25 @@ impl JA4T {
     fn write_to(&self, dst: &mut [u8]) -> usize {
         let mut w = BufWriter { buf: dst, pos: 0 };
 
-        w.push_num(self.window_size as u64);
+        w.push_num(self.window_size);
         w.push(b'_');
 
         let mut first = true;
-        for &opt in &self.options {
+        // イテレータ展開を避けるためにインデックスループを使用
+        for i in 0..32 {
+            let opt = self.options[i]; // ここは静的サイズ内なので安全
             if opt == 0 { break; }
             if !first {
                 w.push(b'-');
             }
             first = false;
-            w.push_num(opt as u64);
+            w.push_num(opt as u16);
         }
 
         w.push(b'_');
-        w.push_num(self.mss as u64);
+        w.push_num(self.mss);
         w.push(b'_');
-        w.push_num(self.wscale as u64);
+        w.push_num(self.wscale as u16);
 
         w.pos
     }
@@ -168,46 +168,36 @@ struct BufWriter<'a> {
 }
 
 impl BufWriter<'_> {
-    #[inline]
+    #[inline(always)]
     fn push(&mut self, b: u8) {
-        if let Some(byte) = self.buf.get_mut(self.pos) {
-            *byte = b;
+        if self.pos < self.buf.len() {
+            // パニック分岐とOption生成を完全に防ぐ生ポインタ書き込み
+            unsafe {
+                *self.buf.as_mut_ptr().add(self.pos) = b;
+            }
             self.pos += 1;
         }
     }
 
-    #[inline]
-    fn push_bytes(&mut self, bytes: &[u8]) {
-        let remain = self.buf.len().saturating_sub(self.pos);
-        let len = core::cmp::min(remain, bytes.len());
-        
-        if let (Some(dst), Some(src)) = (
-            self.buf.get_mut(self.pos..self.pos + len),
-            bytes.get(..len)
-        ) {
-            dst.copy_from_slice(src);
-            self.pos += len;
-        }
-    }
-
-    fn push_num(&mut self, mut n: u64) {
+    // u64からu16に変更 (最大65535のため)。割り算のコストが劇的に下がりVerifierが安定します。
+    #[inline(always)]
+    fn push_num(&mut self, mut n: u16) {
         if n == 0 {
             self.push(b'0');
             return;
         }
         
-        let mut tmp = [0u8; 20];
-        let mut i = 20;
+        let mut tmp = [0u8; 5]; // u16は最大5桁
+        let mut i = 5;
         while n > 0 && i > 0 {
             i -= 1;
-            if let Some(byte) = tmp.get_mut(i) {
-                *byte = b'0' + (n % 10) as u8;
-            }
+            tmp[i] = b'0' + (n % 10) as u8;
             n /= 10;
         }
         
-        if let Some(slice) = tmp.get(i..) {
-            self.push_bytes(slice);
+        // sliceのcopy_from_sliceもOptionを呼ぶ場合があるので、単純なループにします
+        for j in i..5 {
+            self.push(tmp[j]);
         }
     }
 }
