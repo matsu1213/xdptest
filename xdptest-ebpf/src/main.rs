@@ -8,7 +8,7 @@ use aya_log_ebpf::info;
 use network_types::{
     eth::{EthHdr, EtherType},
     ip::{IpProto, Ipv4Hdr},
-    tcp::TcpHdr
+    tcp::TcpHdr,
 };
 
 #[xdp]
@@ -32,22 +32,25 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_PASS);
     }
 
-    let ihl_words = unsafe { (*ipv4hdr).ihl() } as usize;
-    let ipv4_header_len = ihl_words * 4;
+    let ipv4_header_len = unsafe { (*ipv4hdr).ihl() } as usize;
     if ipv4_header_len < Ipv4Hdr::LEN {
         return Ok(xdp_action::XDP_PASS);
     }
 
     let tcp_offset = EthHdr::LEN + ipv4_header_len;
     let tcphdr: *const TcpHdr = ptr_at(&ctx, tcp_offset)?;
-    let syn = unsafe { (*tcphdr).syn() };
-    let ack = unsafe { (*tcphdr).ack() };
+
+    let doff_byte_ptr: *const u8 = ptr_at(&ctx, tcp_offset + 12)?;
+    let flags_byte_ptr: *const u8 = ptr_at(&ctx, tcp_offset + 13)?;
+    let doff = (unsafe { *doff_byte_ptr } >> 4) as u16;
+    let flags = unsafe { *flags_byte_ptr };
+    let syn = if (flags & 0x02) != 0 { 1 } else { 0 };
+    let ack = if (flags & 0x10) != 0 { 1 } else { 0 };
     let is_initial_syn = syn != 0 && ack == 0;
 
     let dest_port = u16::from_be_bytes(unsafe { (*tcphdr).dest });
     let window_size = u16::from_be_bytes(unsafe { (*tcphdr).window });
 
-    let doff = unsafe { (*tcphdr).doff() }; 
     let tcp_header_len = (doff as usize) * 4;
 
     info!(
