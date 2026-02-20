@@ -13,7 +13,7 @@ use network_types::{
 
 struct JA4T {
     window_size: u16,
-    options: [u8; 8], // 最大8個に絞り込み（状態爆発を防止）
+    options: [u8; 8],
     mss: u16,
     wscale: u8
 }
@@ -59,7 +59,6 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
 
     let window_size = u16::from_be_bytes(unsafe { (*tcphdr).window });
 
-    // 初期値を255にして、パースしたオプションと未初期化を区別する
     let mut options = [255u8; 8];
     let mut opt_idx = 0usize;
     let mut mss = 0u16;
@@ -69,40 +68,41 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
     let start = ctx.data();
     let end = ctx.data_end();
 
-    // 【重要】ループを8回に制限。検証機の計算量が激減します。
     for _ in 0..8 {
         offset &= 0x3F; 
         if offset >= max_options_len { break; }
-        if start + opt_base_offset + offset + 1 > end { break; }
         
-        let kind = unsafe { *(start as *const u8).add(opt_base_offset + offset) };
+        let curr_ptr = start + opt_base_offset + offset;
+        if curr_ptr + 1 > end { break; }
+        
+        // 【重要1】read_volatile で LLVMのポインタ結合最適化を強制ブロック
+        let kind = unsafe { core::ptr::read_volatile(curr_ptr as *const u8) };
         
         let safe_idx = opt_idx & 0x07;
-        unsafe { *options.as_mut_ptr().add(safe_idx) = kind; }
+        options[safe_idx] = kind;
         opt_idx += 1;
         
-        if kind == 0 { // End Of List
-            break;
-        } else if kind == 1 { // NOP
-            offset += 1;
-            continue;
+        if kind == 0 { break; } 
+        if kind == 1 { 
+            offset += 1; 
+            continue; 
         }
         
-        if start + opt_base_offset + offset + 2 > end { break; }
-        let opt_len = unsafe { *(start as *const u8).add(opt_base_offset + offset + 1) };
+        if curr_ptr + 2 > end { break; }
+        let opt_len = unsafe { core::ptr::read_volatile((curr_ptr + 1) as *const u8) };
         
-        // 不正な長さでの無限ループを防止
-        if opt_len < 2 { break; } 
+        if opt_len < 2 { break; }
         
-        if kind == 2 && opt_len == 4 { // MSS
-            if start + opt_base_offset + offset + 4 <= end {
-                let b1 = unsafe { *(start as *const u8).add(opt_base_offset + offset + 2) };
-                let b2 = unsafe { *(start as *const u8).add(opt_base_offset + offset + 3) };
+        if kind == 2 && opt_len == 4 {
+            if curr_ptr + 4 <= end {
+                // ここも1バイトずつ確実に読ませる
+                let b1 = unsafe { core::ptr::read_volatile((curr_ptr + 2) as *const u8) };
+                let b2 = unsafe { core::ptr::read_volatile((curr_ptr + 3) as *const u8) };
                 mss = u16::from_be_bytes([b1, b2]);
             }
-        } else if kind == 3 && opt_len == 3 { // WSCALE
-            if start + opt_base_offset + offset + 3 <= end {
-                wscale = unsafe { *(start as *const u8).add(opt_base_offset + offset + 2) };
+        } else if kind == 3 && opt_len == 3 {
+            if curr_ptr + 3 <= end {
+                wscale = unsafe { core::ptr::read_volatile((curr_ptr + 2) as *const u8) };
             }
         }
         
@@ -110,9 +110,9 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
     }
 
     let ja4t = JA4T { window_size, options, mss, wscale };
-
-    let mut ja4t_buf = [0u8; 64];
-    let ja4t_len = ja4t.write_to(&mut ja4t_buf);
+    
+    // 【重要2】スライス渡しをやめ、配列を直接返す形に変更（ファットポインタ回避）
+    let (ja4t_buf, ja4t_len) = ja4t.to_bytes();
     
     let final_len = ja4t_len & 0x3F;
     let ja4t_slice = unsafe { core::slice::from_raw_parts(ja4t_buf.as_ptr(), final_len) };
@@ -124,8 +124,9 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
 }
 
 impl JA4T {
-    fn write_to(&self, dst: &mut [u8]) -> usize {
-        let mut w = BufWriter { buf: dst, pos: 0 };
+    // スライス引数 (&mut [u8]) を消去し、完成した配列と長さを返す
+    fn to_bytes(&self) -> ([u8; 64], usize) {
+        let mut w = BufWriter::new();
 
         w.push_num(self.window_size);
         w.push(b'_');
@@ -133,7 +134,7 @@ impl JA4T {
         let mut first = true;
         for i in 0..8 {
             let opt = self.options[i];
-            if opt == 255 { break; } // 未書き込みの枠に到達したら終了
+            if opt == 255 { break; }
             if !first {
                 w.push(b'-');
             }
@@ -146,28 +147,31 @@ impl JA4T {
         w.push(b'_');
         w.push_num(self.wscale as u16);
 
-        w.pos
+        (w.buf, w.pos)
     }
 }
 
-struct BufWriter<'a> {
-    buf: &'a mut [u8],
+// 参照を持たず、メモリをすべて所有する形に変更
+struct BufWriter {
+    buf: [u8; 64],
     pos: usize,
 }
 
-impl BufWriter<'_> {
+impl BufWriter {
+    #[inline(always)]
+    fn new() -> Self {
+        Self { buf: [0; 64], pos: 0 }
+    }
+
     #[inline(always)]
     fn push(&mut self, b: u8) {
         if self.pos < 64 {
-            let p = self.pos & 0x3F; 
-            unsafe {
-                *self.buf.as_mut_ptr().add(p) = b;
-            }
+            // 安全な配列アクセスに戻す
+            self.buf[self.pos] = b;
             self.pos += 1;
         }
     }
 
-    // 【重要】状態爆発を防ぐため、ループを手動展開（アンロール）
     #[inline(always)]
     fn push_num(&mut self, mut n: u16) {
         if n == 0 {
