@@ -46,7 +46,10 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_PASS);
     }
 
-    let dest_port = u16::from_be_bytes(unsafe { (*tcphdr).dest });
+    // u16::from_be_bytes の内部的なビット演算(|)を回避するための安全な読み込み
+    let dest_port = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*tcphdr).dest) as *const u16).to_be() };
+    let window_size = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*tcphdr).window) as *const u16).to_be() };
+
     let doff = unsafe { (*tcphdr).doff() }; 
     let tcp_header_len = (doff as usize) * 4;
     
@@ -54,10 +57,11 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_PASS);
     }
     
-    let max_options_len = (tcp_header_len.saturating_sub(20)) & 0x3F;
+    // ビット演算(&)を避け、素直な条件分岐で上限を設定
+    let mut max_options_len = tcp_header_len.saturating_sub(20);
+    if max_options_len > 40 { max_options_len = 40; }
+    
     let opt_base_offset = EthHdr::LEN + Ipv4Hdr::LEN + 20;
-
-    let window_size = u16::from_be_bytes(unsafe { (*tcphdr).window });
 
     let mut options = [255u8; 8];
     let mut opt_idx = 0usize;
@@ -69,18 +73,18 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
     let end = ctx.data_end();
 
     for _ in 0..8 {
-        offset &= 0x3F; 
         if offset >= max_options_len { break; }
+        if offset > 40 { break; } // 安全のためのハードリミット
         
         let curr_ptr = start + opt_base_offset + offset;
         if curr_ptr + 1 > end { break; }
         
-        // 【重要1】read_volatile で LLVMのポインタ結合最適化を強制ブロック
         let kind = unsafe { core::ptr::read_volatile(curr_ptr as *const u8) };
         
-        let safe_idx = opt_idx & 0x07;
-        options[safe_idx] = kind;
-        opt_idx += 1;
+        if opt_idx < 8 {
+            options[opt_idx] = kind;
+            opt_idx += 1;
+        }
         
         if kind == 0 { break; } 
         if kind == 1 { 
@@ -95,10 +99,10 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
         
         if kind == 2 && opt_len == 4 {
             if curr_ptr + 4 <= end {
-                // ここも1バイトずつ確実に読ませる
                 let b1 = unsafe { core::ptr::read_volatile((curr_ptr + 2) as *const u8) };
                 let b2 = unsafe { core::ptr::read_volatile((curr_ptr + 3) as *const u8) };
-                mss = u16::from_be_bytes([b1, b2]);
+                // 内部最適化の | を防ぐため、掛け算と足し算を使用
+                mss = (b1 as u16) * 256 + (b2 as u16);
             }
         } else if kind == 3 && opt_len == 3 {
             if curr_ptr + 3 <= end {
@@ -111,11 +115,12 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
 
     let ja4t = JA4T { window_size, options, mss, wscale };
     
-    // 【重要2】スライス渡しをやめ、配列を直接返す形に変更（ファットポインタ回避）
-    let (ja4t_buf, ja4t_len) = ja4t.to_bytes();
+    // 長さ(len)を持たず、純粋な配列のみを受け取る
+    let ja4t_buf = ja4t.to_bytes();
     
-    let final_len = ja4t_len & 0x3F;
-    let ja4t_slice = unsafe { core::slice::from_raw_parts(ja4t_buf.as_ptr(), final_len) };
+    // ✨ 最高の魔法 ✨
+    // aya_log のバグを踏まないように、長さ「64バイト(固定定数)」の文字列として送る！
+    let ja4t_slice = unsafe { core::slice::from_raw_parts(ja4t_buf.as_ptr(), 64) };
     let ja4t_str = unsafe { core::str::from_utf8_unchecked(ja4t_slice) };
 
     info!(&ctx, "SRC IP: {:i}, DST PORT: {}, JA4T: {}", source_addr, dest_port, ja4t_str);
@@ -124,8 +129,7 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
 }
 
 impl JA4T {
-    // スライス引数 (&mut [u8]) を消去し、完成した配列と長さを返す
-    fn to_bytes(&self) -> ([u8; 64], usize) {
+    fn to_bytes(&self) -> [u8; 64] {
         let mut w = BufWriter::new();
 
         w.push_num(self.window_size);
@@ -147,11 +151,10 @@ impl JA4T {
         w.push(b'_');
         w.push_num(self.wscale as u16);
 
-        (w.buf, w.pos)
+        w.buf
     }
 }
 
-// 参照を持たず、メモリをすべて所有する形に変更
 struct BufWriter {
     buf: [u8; 64],
     pos: usize,
@@ -166,7 +169,6 @@ impl BufWriter {
     #[inline(always)]
     fn push(&mut self, b: u8) {
         if self.pos < 64 {
-            // 安全な配列アクセスに戻す
             self.buf[self.pos] = b;
             self.pos += 1;
         }
