@@ -13,7 +13,7 @@ use network_types::{
 
 struct JA4T {
     window_size: u16,
-    options: [u8; 32],
+    options: [u8; 8], // 最大8個に絞り込み（状態爆発を防止）
     mss: u16,
     wscale: u8
 }
@@ -28,9 +28,8 @@ pub fn xdptest(ctx: XdpContext) -> u32 {
 
 fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
     let ethhdr: *const EthHdr = ptr_at(&ctx, 0)?;
-    match unsafe { (*ethhdr).ether_type() } {
-        Ok(EtherType::Ipv4) => {}
-        _ => return Ok(xdp_action::XDP_PASS),
+    if unsafe { (*ethhdr).ether_type() } != Ok(EtherType::Ipv4) {
+        return Ok(xdp_action::XDP_PASS);
     }
 
     let ipv4hdr: *const Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN)?;
@@ -41,14 +40,13 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
     }
 
     let tcphdr: *const TcpHdr = ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
-    let source_port = u16::from_be_bytes(unsafe { (*tcphdr).source });
-    let dest_port = u16::from_be_bytes(unsafe { (*tcphdr).dest });
     let is_initial_syn = unsafe { (*tcphdr).syn() != 0 && (*tcphdr).ack() == 0 };
     
     if !is_initial_syn {
         return Ok(xdp_action::XDP_PASS);
     }
 
+    let dest_port = u16::from_be_bytes(unsafe { (*tcphdr).dest });
     let doff = unsafe { (*tcphdr).doff() }; 
     let tcp_header_len = (doff as usize) * 4;
     
@@ -56,14 +54,14 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_PASS);
     }
     
-    // 最大オプション長を 0〜63 の範囲に強制的に収める
     let max_options_len = (tcp_header_len.saturating_sub(20)) & 0x3F;
     let opt_base_offset = EthHdr::LEN + Ipv4Hdr::LEN + 20;
 
     let window_size = u16::from_be_bytes(unsafe { (*tcphdr).window });
 
-    let mut options = [0u8; 32];
-    let mut index = 0usize;
+    // 初期値を255にして、パースしたオプションと未初期化を区別する
+    let mut options = [255u8; 8];
+    let mut opt_idx = 0usize;
     let mut mss = 0u16;
     let mut wscale = 0u8;
     let mut offset = 0usize;
@@ -71,30 +69,30 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
     let start = ctx.data();
     let end = ctx.data_end();
 
-    // パケットから直接パース（スタックコピー不要）
-    for _ in 0..20 {
-        // 【重要1】offset を強制的に 0〜63 にバウンドする（var_offエラー回避）
+    // 【重要】ループを8回に制限。検証機の計算量が激減します。
+    for _ in 0..8 {
         offset &= 0x3F; 
         if offset >= max_options_len { break; }
-
         if start + opt_base_offset + offset + 1 > end { break; }
         
         let kind = unsafe { *(start as *const u8).add(opt_base_offset + offset) };
         
-        // 【重要2】スタック配列へのアクセスもインデックスを 0〜31 に強制バウンドする
-        let idx = index & 0x1F; 
-        unsafe { *options.as_mut_ptr().add(idx) = kind; }
+        let safe_idx = opt_idx & 0x07;
+        unsafe { *options.as_mut_ptr().add(safe_idx) = kind; }
+        opt_idx += 1;
         
-        if kind == 0 || kind == 1 {
+        if kind == 0 { // End Of List
+            break;
+        } else if kind == 1 { // NOP
             offset += 1;
-            index += 1;
             continue;
         }
         
         if start + opt_base_offset + offset + 2 > end { break; }
         let opt_len = unsafe { *(start as *const u8).add(opt_base_offset + offset + 1) };
         
-        if opt_len == 0 { break; } 
+        // 不正な長さでの無限ループを防止
+        if opt_len < 2 { break; } 
         
         if kind == 2 && opt_len == 4 { // MSS
             if start + opt_base_offset + offset + 4 <= end {
@@ -108,17 +106,15 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
             }
         }
         
-        // ここで offset に u8 の値を足すが、次回のループ開始時に `offset &= 0x3F` されるため安全
         offset += opt_len as usize;
-        index += 1;
     }
 
-    let ja4t = JA4T::new(window_size, options, mss, wscale);
+    let ja4t = JA4T { window_size, options, mss, wscale };
 
     let mut ja4t_buf = [0u8; 64];
     let ja4t_len = ja4t.write_to(&mut ja4t_buf);
     
-    let final_len = if ja4t_len > 64 { 64 } else { ja4t_len };
+    let final_len = ja4t_len & 0x3F;
     let ja4t_slice = unsafe { core::slice::from_raw_parts(ja4t_buf.as_ptr(), final_len) };
     let ja4t_str = unsafe { core::str::from_utf8_unchecked(ja4t_slice) };
 
@@ -128,10 +124,6 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
 }
 
 impl JA4T {
-    fn new(window_size: u16, options: [u8; 32], mss: u16, wscale: u8) -> Self {
-        Self { window_size, options, mss, wscale }
-    }
-
     fn write_to(&self, dst: &mut [u8]) -> usize {
         let mut w = BufWriter { buf: dst, pos: 0 };
 
@@ -139,10 +131,9 @@ impl JA4T {
         w.push(b'_');
 
         let mut first = true;
-        for i in 0..32 {
-            // ここも強制バウンド
-            let opt = self.options[i & 0x1F]; 
-            if opt == 0 { break; }
+        for i in 0..8 {
+            let opt = self.options[i];
+            if opt == 255 { break; } // 未書き込みの枠に到達したら終了
             if !first {
                 w.push(b'-');
             }
@@ -168,7 +159,6 @@ impl BufWriter<'_> {
     #[inline(always)]
     fn push(&mut self, b: u8) {
         if self.pos < 64 {
-            // 【重要3】バッファへの書き込みインデックスも強制バウンド（var_offエラー回避）
             let p = self.pos & 0x3F; 
             unsafe {
                 *self.buf.as_mut_ptr().add(p) = b;
@@ -177,6 +167,7 @@ impl BufWriter<'_> {
         }
     }
 
+    // 【重要】状態爆発を防ぐため、ループを手動展開（アンロール）
     #[inline(always)]
     fn push_num(&mut self, mut n: u16) {
         if n == 0 {
@@ -185,14 +176,18 @@ impl BufWriter<'_> {
         }
         let mut tmp = [0u8; 5]; 
         let mut i = 5;
-        while n > 0 && i > 0 {
-            i -= 1;
-            tmp[i] = b'0' + (n % 10) as u8;
-            n /= 10;
-        }
-        for j in i..5 {
-            self.push(tmp[j]);
-        }
+        
+        if n > 0 { i -= 1; tmp[i] = b'0' + (n % 10) as u8; n /= 10; }
+        if n > 0 { i -= 1; tmp[i] = b'0' + (n % 10) as u8; n /= 10; }
+        if n > 0 { i -= 1; tmp[i] = b'0' + (n % 10) as u8; n /= 10; }
+        if n > 0 { i -= 1; tmp[i] = b'0' + (n % 10) as u8; n /= 10; }
+        if n > 0 { i -= 1; tmp[i] = b'0' + (n % 10) as u8; n /= 10; }
+        
+        if i <= 0 { self.push(tmp[0]); }
+        if i <= 1 { self.push(tmp[1]); }
+        if i <= 2 { self.push(tmp[2]); }
+        if i <= 3 { self.push(tmp[3]); }
+        if i <= 4 { self.push(tmp[4]); }
     }
 }
 
