@@ -32,7 +32,14 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_PASS);
     }
 
-    let tcphdr: *const TcpHdr = ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
+    let ihl_words = unsafe { (*ipv4hdr).ihl() } as usize;
+    let ipv4_header_len = ihl_words * 4;
+    if ipv4_header_len < Ipv4Hdr::LEN {
+        return Ok(xdp_action::XDP_PASS);
+    }
+
+    let tcp_offset = EthHdr::LEN + ipv4_header_len;
+    let tcphdr: *const TcpHdr = ptr_at(&ctx, tcp_offset)?;
     let is_initial_syn = unsafe { (*tcphdr).syn() != 0 && (*tcphdr).ack() == 0 };
     
     if !is_initial_syn {
@@ -52,7 +59,7 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
     let mut max_options_len = tcp_header_len.saturating_sub(20);
     if max_options_len > 40 { max_options_len = 40; }
     
-    let opt_base_offset = EthHdr::LEN + Ipv4Hdr::LEN + 20;
+    let opt_base_offset = tcp_offset + 20;
 
     let mut options = [255u8; 8];
     let mut opt_idx = 0usize;
@@ -69,12 +76,13 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
             None => break,
         };
         
+        if kind == 0 { break; }
+
         if opt_idx < 8 {
             options[opt_idx] = kind;
             opt_idx += 1;
         }
-        
-        if kind == 0 { break; } 
+
         if kind == 1 {
             offset += 1;
             continue;
@@ -112,23 +120,17 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
         offset = next_offset;
     }
 
-    info!(
-        &ctx,
-        "SRC IP: {:i}, DST PORT: {}, WIN: {}, MSS: {}, WS: {}, OPTS: {}-{}-{}-{}-{}-{}-{}-{}",
-        source_addr,
-        dest_port,
-        window_size,
-        mss,
-        wscale,
-        options[0],
-        options[1],
-        options[2],
-        options[3],
-        options[4],
-        options[5],
-        options[6],
-        options[7]
-    );
+    match opt_idx {
+        0 => info!(&ctx, "SRC IP: {:i}, DST PORT: {}, JA4T: {}__{}_{}", source_addr, dest_port, window_size, mss, wscale),
+        1 => info!(&ctx, "SRC IP: {:i}, DST PORT: {}, JA4T: {}_{}_{}_{}", source_addr, dest_port, window_size, options[0], mss, wscale),
+        2 => info!(&ctx, "SRC IP: {:i}, DST PORT: {}, JA4T: {}_{}-{}_{}_{}", source_addr, dest_port, window_size, options[0], options[1], mss, wscale),
+        3 => info!(&ctx, "SRC IP: {:i}, DST PORT: {}, JA4T: {}_{}-{}-{}_{}_{}", source_addr, dest_port, window_size, options[0], options[1], options[2], mss, wscale),
+        4 => info!(&ctx, "SRC IP: {:i}, DST PORT: {}, JA4T: {}_{}-{}-{}-{}_{}_{}", source_addr, dest_port, window_size, options[0], options[1], options[2], options[3], mss, wscale),
+        5 => info!(&ctx, "SRC IP: {:i}, DST PORT: {}, JA4T: {}_{}-{}-{}-{}-{}_{}_{}", source_addr, dest_port, window_size, options[0], options[1], options[2], options[3], options[4], mss, wscale),
+        6 => info!(&ctx, "SRC IP: {:i}, DST PORT: {}, JA4T: {}_{}-{}-{}-{}-{}-{}_{}_{}", source_addr, dest_port, window_size, options[0], options[1], options[2], options[3], options[4], options[5], mss, wscale),
+        7 => info!(&ctx, "SRC IP: {:i}, DST PORT: {}, JA4T: {}_{}-{}-{}-{}-{}-{}-{}_{}_{}", source_addr, dest_port, window_size, options[0], options[1], options[2], options[3], options[4], options[5], options[6], mss, wscale),
+        _ => info!(&ctx, "SRC IP: {:i}, DST PORT: {}, JA4T: {}_{}-{}-{}-{}-{}-{}-{}-{}_{}_{}", source_addr, dest_port, window_size, options[0], options[1], options[2], options[3], options[4], options[5], options[6], options[7], mss, wscale),
+    };
 
     Ok(xdp_action::XDP_PASS)
 }
