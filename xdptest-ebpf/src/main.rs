@@ -53,8 +53,9 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
     let tcp_header_len = (doff as usize) * 4;
 
     let mut offset = EthHdr::LEN + Ipv4Hdr::LEN + 20;
-    let options_end = EthHdr::LEN + Ipv4Hdr::LEN + tcp_header_len;
-
+    
+    let max_safe_offset = EthHdr::LEN + Ipv4Hdr::LEN + 60;
+    
     let window_size = u16::from_be_bytes(unsafe { (*tcphdr).window});
 
     let mut options = [0u8; 32];
@@ -65,12 +66,18 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
     let start = ctx.data();
     let end = ctx.data_end();
 
-    for _ in 0..50 {
-        if offset >= options_end { break; }
+    let read_byte = |off: usize| -> Result<u8, ()> {
+        if start + off + 1 > end {
+            return Err(());
+        }
+        Ok(unsafe { *(start as *const u8).add(off) })
+    };
 
-        if start + offset + 1 > end { break; }
+    for _ in 0..15 {
+        if offset >= EthHdr::LEN + Ipv4Hdr::LEN + tcp_header_len { break; }
+        if offset >= max_safe_offset { break; }
 
-        let kind = unsafe { *(start as *const u8).add(offset) };
+        let Ok(kind) = read_byte(offset) else { break };
         
         if let Some(opt) = options.get_mut(index) {
             *opt = kind;
@@ -78,35 +85,37 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
         
         offset += 1;
 
-        if kind == 0 {
-            continue;
-        } else if kind == 1 {
+        if kind == 0 || kind == 1 {
+            // End of Option List (0) or No-Operation (1)
+            index += 1;
             continue;
         } else if kind == 2 {
-            // MSS Option
-            if offset + 3 > options_end || start + offset + 3 > end {
-                continue; 
+            // MSS Option (Length 4)
+            if offset + 3 > max_safe_offset { break; } // 固定値上限チェック
+            
+            let Ok(length) = read_byte(offset) else { break };
+            if length == 4 {
+                if let (Ok(b1), Ok(b2)) = (read_byte(offset + 1), read_byte(offset + 2)) {
+                    mss = u16::from_be_bytes([b1, b2]);
+                }
             }
-            let length = unsafe { *(start as *const u8).add(offset) };
-            if length != 4 {
-                continue; 
-            }
-            mss = u16::from_be_bytes([
-                unsafe { *(start as *const u8).add(offset + 1) },
-                unsafe { *(start as *const u8).add(offset + 2) },
-            ]);
-            offset += 3; 
+            offset += length.saturating_sub(1) as usize; 
         } else if kind == 3 {
-            // WSCALE Option
-            if offset + 2 > options_end || start + offset + 2 > end {
-                continue; 
+            // WSCALE Option (Length 3)
+            if offset + 2 > max_safe_offset { break; }
+            
+            let Ok(length) = read_byte(offset) else { break };
+            if length == 3 {
+                if let Ok(w) = read_byte(offset + 1) {
+                    wscale = w;
+                }
             }
-            let length = unsafe { *(start as *const u8).add(offset) };
-            if length != 3 {
-                continue; 
-            }
-            wscale = unsafe { *(start as *const u8).add(offset + 1) };
-            offset += 2; 
+            offset += length.saturating_sub(1) as usize;
+        } else {
+            if offset + 1 > max_safe_offset { break; }
+            let Ok(length) = read_byte(offset) else { break };
+            if length == 0 { break; } 
+            offset += length.saturating_sub(1) as usize;
         }
         index += 1;
     }
