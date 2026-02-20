@@ -62,7 +62,9 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
     let mut mss = 0u16;
     let mut wscale = 0u8;
 
-    while offset < options_end {
+    for _ in 0..50 {
+        if offset >= options_end { break; }
+
         let kind = unsafe { *(ctx.data() as *const u8).add(offset) };
         if index < options.len() {
             options[index] = kind;
