@@ -11,13 +11,6 @@ use network_types::{
     tcp::TcpHdr
 };
 
-struct JA4T {
-    window_size: u16,
-    options: [u8; 8],
-    mss: u16,
-    wscale: u8
-}
-
 #[xdp]
 pub fn xdptest(ctx: XdpContext) -> u32 {
     match try_xdptest(ctx) {
@@ -46,9 +39,8 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_PASS);
     }
 
-    // u16::from_be_bytes の内部的なビット演算(|)を回避するための安全な読み込み
-    let dest_port = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*tcphdr).dest) as *const u16).to_be() };
-    let window_size = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*tcphdr).window) as *const u16).to_be() };
+    let dest_port = u16::from_be_bytes(unsafe { (*tcphdr).dest });
+    let window_size = u16::from_be_bytes(unsafe { (*tcphdr).window });
 
     let doff = unsafe { (*tcphdr).doff() }; 
     let tcp_header_len = (doff as usize) * 4;
@@ -57,7 +49,6 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_PASS);
     }
     
-    // ビット演算(&)を避け、素直な条件分岐で上限を設定
     let mut max_options_len = tcp_header_len.saturating_sub(20);
     if max_options_len > 40 { max_options_len = 40; }
     
@@ -69,17 +60,14 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
     let mut wscale = 0u8;
     let mut offset = 0usize;
 
-    let start = ctx.data();
-    let end = ctx.data_end();
-
     for _ in 0..8 {
         if offset >= max_options_len { break; }
-        if offset > 40 { break; } // 安全のためのハードリミット
-        
-        let curr_ptr = start + opt_base_offset + offset;
-        if curr_ptr + 1 > end { break; }
-        
-        let kind = unsafe { core::ptr::read_volatile(curr_ptr as *const u8) };
+        if offset > 40 { break; }
+
+        let kind = match read_u8(&ctx, opt_base_offset + offset) {
+            Some(v) => v,
+            None => break,
+        };
         
         if opt_idx < 8 {
             options[opt_idx] = kind;
@@ -87,114 +75,69 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
         }
         
         if kind == 0 { break; } 
-        if kind == 1 { 
-            offset += 1; 
-            continue; 
+        if kind == 1 {
+            offset += 1;
+            continue;
         }
-        
-        if curr_ptr + 2 > end { break; }
-        let opt_len = unsafe { core::ptr::read_volatile((curr_ptr + 1) as *const u8) };
+
+        let opt_len = match read_u8(&ctx, opt_base_offset + offset + 1) {
+            Some(v) => v,
+            None => break,
+        };
         
         if opt_len < 2 { break; }
         
-        if kind == 2 && opt_len == 4 {
-            if curr_ptr + 4 <= end {
-                let b1 = unsafe { core::ptr::read_volatile((curr_ptr + 2) as *const u8) };
-                let b2 = unsafe { core::ptr::read_volatile((curr_ptr + 3) as *const u8) };
-                // 内部最適化の | を防ぐため、掛け算と足し算を使用
-                mss = (b1 as u16) * 256 + (b2 as u16);
-            }
-        } else if kind == 3 && opt_len == 3 {
-            if curr_ptr + 3 <= end {
-                wscale = unsafe { core::ptr::read_volatile((curr_ptr + 2) as *const u8) };
-            }
+        let next_offset = offset + opt_len as usize;
+        if next_offset > max_options_len {
+            break;
         }
-        
-        offset += opt_len as usize;
+
+        if kind == 2 && opt_len == 4 {
+            let b1 = match read_u8(&ctx, opt_base_offset + offset + 2) {
+                Some(v) => v,
+                None => break,
+            };
+            let b2 = match read_u8(&ctx, opt_base_offset + offset + 3) {
+                Some(v) => v,
+                None => break,
+            };
+            mss = u16::from_be_bytes([b1, b2]);
+        } else if kind == 3 && opt_len == 3 {
+            wscale = match read_u8(&ctx, opt_base_offset + offset + 2) {
+                Some(v) => v,
+                None => break,
+            };
+        }
+
+        offset = next_offset;
     }
 
-    let ja4t = JA4T { window_size, options, mss, wscale };
-    
-    // 長さ(len)を持たず、純粋な配列のみを受け取る
-    let ja4t_buf = ja4t.to_bytes();
-    
-    // ✨ 最高の魔法 ✨
-    // aya_log のバグを踏まないように、長さ「64バイト(固定定数)」の文字列として送る！
-    let ja4t_slice = unsafe { core::slice::from_raw_parts(ja4t_buf.as_ptr(), 64) };
-    let ja4t_str = unsafe { core::str::from_utf8_unchecked(ja4t_slice) };
-
-    info!(&ctx, "SRC IP: {:i}, DST PORT: {}, JA4T: {}", source_addr, dest_port, ja4t_str);
+    info!(
+        &ctx,
+        "SRC IP: {:i}, DST PORT: {}, WIN: {}, MSS: {}, WS: {}, OPTS: {}-{}-{}-{}-{}-{}-{}-{}",
+        source_addr,
+        dest_port,
+        window_size,
+        mss,
+        wscale,
+        options[0],
+        options[1],
+        options[2],
+        options[3],
+        options[4],
+        options[5],
+        options[6],
+        options[7]
+    );
 
     Ok(xdp_action::XDP_PASS)
 }
 
-impl JA4T {
-    fn to_bytes(&self) -> [u8; 64] {
-        let mut w = BufWriter::new();
 
-        w.push_num(self.window_size);
-        w.push(b'_');
-
-        let mut first = true;
-        for i in 0..8 {
-            let opt = self.options[i];
-            if opt == 255 { break; }
-            if !first {
-                w.push(b'-');
-            }
-            first = false;
-            w.push_num(opt as u16);
-        }
-
-        w.push(b'_');
-        w.push_num(self.mss);
-        w.push(b'_');
-        w.push_num(self.wscale as u16);
-
-        w.buf
-    }
-}
-
-struct BufWriter {
-    buf: [u8; 64],
-    pos: usize,
-}
-
-impl BufWriter {
-    #[inline(always)]
-    fn new() -> Self {
-        Self { buf: [0; 64], pos: 0 }
-    }
-
-    #[inline(always)]
-    fn push(&mut self, b: u8) {
-        if self.pos < 64 {
-            self.buf[self.pos] = b;
-            self.pos += 1;
-        }
-    }
-
-    #[inline(always)]
-    fn push_num(&mut self, mut n: u16) {
-        if n == 0 {
-            self.push(b'0');
-            return;
-        }
-        let mut tmp = [0u8; 5]; 
-        let mut i = 5;
-        
-        if n > 0 { i -= 1; tmp[i] = b'0' + (n % 10) as u8; n /= 10; }
-        if n > 0 { i -= 1; tmp[i] = b'0' + (n % 10) as u8; n /= 10; }
-        if n > 0 { i -= 1; tmp[i] = b'0' + (n % 10) as u8; n /= 10; }
-        if n > 0 { i -= 1; tmp[i] = b'0' + (n % 10) as u8; n /= 10; }
-        if n > 0 { i -= 1; tmp[i] = b'0' + (n % 10) as u8; n /= 10; }
-        
-        if i <= 0 { self.push(tmp[0]); }
-        if i <= 1 { self.push(tmp[1]); }
-        if i <= 2 { self.push(tmp[2]); }
-        if i <= 3 { self.push(tmp[3]); }
-        if i <= 4 { self.push(tmp[4]); }
-    }
+#[inline(always)]
+fn read_u8(ctx: &XdpContext, offset: usize) -> Option<u8> {
+    let p = ptr_at::<u8>(ctx, offset).ok()?;
+    Some(unsafe { *p })
 }
 
 #[inline(always)]
