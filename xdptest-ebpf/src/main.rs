@@ -49,21 +49,23 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
 
     let doff = unsafe { (*tcphdr).doff() }; 
     let tcp_header_len = (doff as usize) * 4;
+
+    info!(
+        &ctx,
+        "TCP seen: src={:i} dport={} syn={} ack={} ihl={} doff={}",
+        source_addr,
+        dest_port,
+        syn,
+        ack,
+        ipv4_header_len,
+        doff
+    );
     
     if tcp_header_len < 20 {
         return Ok(xdp_action::XDP_PASS);
     }
 
     if !is_initial_syn {
-        info!(
-            &ctx,
-            "SRC IP: {:i}, DST PORT: {}, TCP state syn={} ack={} doff={}",
-            source_addr,
-            dest_port,
-            syn,
-            ack,
-            doff
-        );
         return Ok(xdp_action::XDP_PASS);
     }
     
