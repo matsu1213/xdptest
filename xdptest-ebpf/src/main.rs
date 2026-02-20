@@ -49,16 +49,24 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_PASS);
     }
 
-    let doff = unsafe { (*tcphdr).doff() }; 
+    let doff = unsafe { (*tcphdr).doff() } & 0x0F; 
     let tcp_header_len = (doff as usize) * 4;
     
-    // TCPヘッダが20バイト未満は不正、オプションは最大40バイト
+    // TCPヘッダが20バイト未満は不正
     if tcp_header_len < 20 {
         return Ok(xdp_action::XDP_PASS);
     }
-    let options_len = core::cmp::min(tcp_header_len - 20, 40);
 
-    // 【魔法の解決策】TCPオプションをスタックに一括コピーする
+    // 【修正2 魔法のコード】
+    // saturating_sub で絶対にマイナスにさせない ＋ `& 0x3F` で最大63以下に縛る！
+    // これにより Verifier は「あ、この変数は 0〜63 の範囲の正の数だな」と100%確信します。
+    let mut options_len = tcp_header_len.saturating_sub(20) & 0x3F;
+    
+    // 念のため40を超えないようにする
+    if options_len > 40 {
+        options_len = 40;
+    }
+
     let mut tcp_options_buf = [0u8; 40];
     
     if options_len > 0 {
@@ -66,12 +74,12 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
         let start = ctx.data();
         let end = ctx.data_end();
         
-        // パケットの境界チェックは、ここで「1回だけ」行う！
+        // Verifierが options_len は「0〜40の正の数」と理解したので、
+        // 以下の pointer math で unbounded min エラーが出なくなります。
         if start + opt_offset + options_len > end {
             return Ok(xdp_action::XDP_PASS); 
         }
         
-        // 安全が証明されたので、40バイトのローカル配列に一括コピー
         unsafe {
             core::ptr::copy_nonoverlapping(
                 (start + opt_offset) as *const u8,
