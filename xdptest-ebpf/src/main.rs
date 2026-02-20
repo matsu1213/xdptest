@@ -40,11 +40,9 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
 
     let tcp_offset = EthHdr::LEN + ipv4_header_len;
     let tcphdr: *const TcpHdr = ptr_at(&ctx, tcp_offset)?;
-    let is_initial_syn = unsafe { (*tcphdr).syn() != 0 && (*tcphdr).ack() == 0 };
-    
-    if !is_initial_syn {
-        return Ok(xdp_action::XDP_PASS);
-    }
+    let syn = unsafe { (*tcphdr).syn() };
+    let ack = unsafe { (*tcphdr).ack() };
+    let is_initial_syn = syn != 0 && ack == 0;
 
     let dest_port = u16::from_be_bytes(unsafe { (*tcphdr).dest });
     let window_size = u16::from_be_bytes(unsafe { (*tcphdr).window });
@@ -53,6 +51,19 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
     let tcp_header_len = (doff as usize) * 4;
     
     if tcp_header_len < 20 {
+        return Ok(xdp_action::XDP_PASS);
+    }
+
+    if !is_initial_syn {
+        info!(
+            &ctx,
+            "SRC IP: {:i}, DST PORT: {}, TCP state syn={} ack={} doff={}",
+            source_addr,
+            dest_port,
+            syn,
+            ack,
+            doff
+        );
         return Ok(xdp_action::XDP_PASS);
     }
     
