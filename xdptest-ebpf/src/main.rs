@@ -66,15 +66,19 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
     let mut mss = 0u16;
     let mut wscale = 0u8;
     let mut offset = 0usize;
+    let start = ctx.data();
+    let end = ctx.data_end();
 
     for _ in 0..8 {
         if offset >= max_options_len { break; }
         if offset > 40 { break; }
 
-        let kind = match read_u8(&ctx, opt_base_offset + offset) {
-            Some(v) => v,
-            None => break,
-        };
+        let curr_ptr = start + opt_base_offset + offset;
+        if curr_ptr + 1 > end {
+            break;
+        }
+
+        let kind = unsafe { core::ptr::read_volatile(curr_ptr as *const u8) };
         
         if kind == 0 { break; }
 
@@ -88,10 +92,10 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
             continue;
         }
 
-        let opt_len = match read_u8(&ctx, opt_base_offset + offset + 1) {
-            Some(v) => v,
-            None => break,
-        };
+        if curr_ptr + 2 > end {
+            break;
+        }
+        let opt_len = unsafe { core::ptr::read_volatile((curr_ptr + 1) as *const u8) };
         
         if opt_len < 2 { break; }
         
@@ -101,20 +105,17 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
         }
 
         if kind == 2 && opt_len == 4 {
-            let b1 = match read_u8(&ctx, opt_base_offset + offset + 2) {
-                Some(v) => v,
-                None => break,
-            };
-            let b2 = match read_u8(&ctx, opt_base_offset + offset + 3) {
-                Some(v) => v,
-                None => break,
-            };
+            if curr_ptr + 4 > end {
+                break;
+            }
+            let b1 = unsafe { core::ptr::read_volatile((curr_ptr + 2) as *const u8) };
+            let b2 = unsafe { core::ptr::read_volatile((curr_ptr + 3) as *const u8) };
             mss = u16::from_be_bytes([b1, b2]);
         } else if kind == 3 && opt_len == 3 {
-            wscale = match read_u8(&ctx, opt_base_offset + offset + 2) {
-                Some(v) => v,
-                None => break,
-            };
+            if curr_ptr + 3 > end {
+                break;
+            }
+            wscale = unsafe { core::ptr::read_volatile((curr_ptr + 2) as *const u8) };
         }
 
         offset = next_offset;
@@ -135,12 +136,6 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
     Ok(xdp_action::XDP_PASS)
 }
 
-
-#[inline(always)]
-fn read_u8(ctx: &XdpContext, offset: usize) -> Option<u8> {
-    let p = ptr_at::<u8>(ctx, offset).ok()?;
-    Some(unsafe { *p })
-}
 
 #[inline(always)]
 fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
