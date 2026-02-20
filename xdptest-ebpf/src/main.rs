@@ -38,12 +38,17 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
     }
 
     let tcp_offset = EthHdr::LEN + ipv4_header_len;
-    let tcphdr: *const TcpHdr = ptr_at(&ctx, tcp_offset)?;
+    let start = ctx.data();
+    let end = ctx.data_end();
 
-    let doff_byte_ptr: *const u8 = ptr_at(&ctx, tcp_offset + 12)?;
-    let flags_byte_ptr: *const u8 = ptr_at(&ctx, tcp_offset + 13)?;
-    let doff = (unsafe { *doff_byte_ptr } >> 4) as u16;
-    let flags = unsafe { *flags_byte_ptr };
+    let tcp_ptr = start + tcp_offset;
+    if tcp_ptr + TcpHdr::LEN > end {
+        return Ok(xdp_action::XDP_PASS);
+    }
+
+    let tcphdr: *const TcpHdr = tcp_ptr as *const TcpHdr;
+    let doff = (unsafe { core::ptr::read_volatile((tcp_ptr + 12) as *const u8) } >> 4) as u16;
+    let flags = unsafe { core::ptr::read_volatile((tcp_ptr + 13) as *const u8) };
     let syn = if (flags & 0x02) != 0 { 1 } else { 0 };
     let ack = if (flags & 0x10) != 0 { 1 } else { 0 };
     let is_initial_syn = syn != 0 && ack == 0;
@@ -71,9 +76,6 @@ fn try_xdptest(ctx: XdpContext) -> Result<u32, ()> {
     let mut mss = 0u16;
     let mut wscale = 0u8;
     let mut offset = 0usize;
-    let start = ctx.data();
-    let end = ctx.data_end();
-
     for _ in 0..8 {
         if offset >= max_options_len { break; }
         if offset > 40 { break; }
